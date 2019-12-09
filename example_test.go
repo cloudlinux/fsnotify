@@ -13,7 +13,7 @@ import (
 )
 
 func ExampleNewWatcher() {
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := fsnotify.NewWatcher(fsnotify.DefaultFlags)
 	if err != nil {
 		log.Fatal(err)
 	}
