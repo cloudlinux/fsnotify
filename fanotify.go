@@ -21,7 +21,7 @@ type FanotifyWatcher struct {
 }
 
 func NewFanotifyWatcher() (*FanotifyWatcher, error) {
-	fd, err := unix.FanotifyInit(unix.FAN_CLASS_NOTIF, unix.O_RDONLY|unix.O_LARGEFILE)
+	fd, err := unix.FanotifyInit(unix.FAN_CLASS_NOTIF, unix.O_RDONLY|unix.O_LARGEFILE|unix.FAN_MOVED_TO)
 	if fd < 0 {
 		return nil, err
 	}
