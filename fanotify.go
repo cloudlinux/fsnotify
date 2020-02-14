@@ -21,7 +21,7 @@ type FanotifyWatcher struct {
 }
 
 func NewFanotifyWatcher() (*FanotifyWatcher, error) {
-	fd, err := unix.FanotifyInit(unix.FAN_CLASS_NOTIF, unix.O_RDONLY|unix.O_LARGEFILE|unix.FAN_MOVED_TO)
+	fd, err := unix.FanotifyInit(unix.FAN_CLASS_NOTIF, unix.O_RDONLY|unix.O_LARGEFILE)
 	if fd < 0 {
 		return nil, err
 	}
@@ -47,7 +47,7 @@ func NewFanotifyWatcher() (*FanotifyWatcher, error) {
 func (fw *FanotifyWatcher) Add(path string) error {
 	err := unix.FanotifyMark(
 		fw.fd,
-		unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT,
+		unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT|unix.FAN_MOVED_TO,
 		unix.FAN_CLOSE_WRITE,
 		unix.AT_FDCWD,
 		path,
