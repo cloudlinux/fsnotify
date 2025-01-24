@@ -1,29 +1,105 @@
 package fsnotify
 
+import "C"
 import (
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-type FanotifyWatcher struct {
-	Fd       int
-	done     chan struct{} // Channel for sending a "quit message" to the reader goroutine
-	doneResp chan struct{} // Channel to respond to Close
-	Events   chan Event
-	Errors   chan error
-	poller   *FdPoller
-
-	MarkType uint
+type fanotifyEventInfoHeader struct {
+	InfoType uint8
+	Pad      uint8
+	Len      uint16
 }
 
-func NewFanotifyWatcher(markType uint) (*FanotifyWatcher, error) {
-	fd, err := unix.FanotifyInit(unix.FAN_CLASS_NOTIF, unix.O_RDONLY|unix.O_LARGEFILE)
+// fanotifyEventInfoFID represents fanotify_event_info_fid structure (see fanotify man page)
+type fanotifyEventInfoFID struct {
+	Hdr  fanotifyEventInfoHeader
+	Fsid unix.Fsid
+	// FileHandle starts here
+}
+
+const (
+	sizeOfFileHandleHdr        = C.sizeof_uint + C.sizeof_int
+	sizeOfFanotifyEventInfoFID = (int)(unsafe.Sizeof(fanotifyEventInfoFID{}))
+)
+
+func (f *fanotifyEventInfoFID) GetHandle(n int) (unix.FileHandle, error) {
+	fid := f
+	// Get pointer to the start of FileHandle
+	fileHandlePtr := unsafe.Pointer(uintptr(unsafe.Pointer(fid)) + unsafe.Sizeof(*fid))
+
+	// Check if hdr len exceeds n or has insufficient length
+	if int(fid.Hdr.Len) > n || int(fid.Hdr.Len) < sizeOfFanotifyEventInfoFID+sizeOfFileHandleHdr {
+		return unix.FileHandle{}, fmt.Errorf(
+			"GetHandle: out of bounds. Expected size n: %v, fid.Hdr.Len: %v",
+			n,
+			fid.Hdr.Len,
+		)
+	}
+	// The length of the buffer can be calculated from the Header's Len field
+	// Subtract the size of the header to get the FileHandle buffer length
+	bufferLen := int(fid.Hdr.Len) - sizeOfFanotifyEventInfoFID
+	// Create a slice from the pointer
+	buf := unsafe.Slice((*byte)(fileHandlePtr), bufferLen)
+
+	// Get size and type of file_handle
+	size := uint(*(*C.uint)(unsafe.Pointer(&buf[0])))
+	typ := int32(*(*C.int)(unsafe.Pointer(&buf[C.sizeof_uint])))
+
+	// Check if file_handle size is in bounds of n
+	bufferLen = sizeOfFanotifyEventInfoFID + sizeOfFileHandleHdr + int(size)
+	if bufferLen > n {
+		return unix.FileHandle{}, fmt.Errorf(
+			"GetHandle: out of bounds. Expected size: %v, actual size: %v",
+			n,
+			bufferLen,
+		)
+	}
+
+	return unix.NewFileHandle(typ, buf[sizeOfFileHandleHdr:sizeOfFileHandleHdr+int(size)]), nil
+}
+
+func getPathFromHandle(mountFd int, handle unix.FileHandle) (string, error) {
+	fd, err := unix.OpenByHandleAt(mountFd, handle, unix.O_PATH)
+	if err != nil {
+		return "", fmt.Errorf("open_by_handle_at failed: %v", err)
+	}
+	defer unix.Close(fd)
+
+	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
+	path := make([]byte, unix.PathMax)
+
+	n, err := unix.Readlink(procPath, path)
+	if err != nil {
+		return "", fmt.Errorf("readlink failed: %v", err)
+	}
+
+	return string(path[:n]), nil
+}
+
+type FanotifyWatcher struct {
+	Fd         int
+	done       chan struct{} // Channel for sending a "quit message" to the reader goroutine
+	doneResp   chan struct{} // Channel to respond to Close
+	isWatching atomic.Bool
+	Events     chan Event
+	Errors     chan error
+	poller     *FdPoller
+	mask       uint64
+	flags      uint
+	mountPath  string
+}
+
+func NewFanotifyWatcher(flags uint, eventFFlags uint, addMask uint64, addFlags uint) (*FanotifyWatcher, error) {
+	fd, err := unix.FanotifyInit(flags, eventFFlags)
 	if fd < 0 {
 		return nil, err
 	}
@@ -41,27 +117,33 @@ func NewFanotifyWatcher(markType uint) (*FanotifyWatcher, error) {
 		Events:   make(chan Event),
 		Errors:   make(chan error),
 		poller:   poller,
-		MarkType: markType,
+		flags:    addFlags,
+		mask:     addMask,
 	}
 	go fw.readEvents()
 	return fw, nil
 }
 
-func (fw *FanotifyWatcher) Add(path string, mask uint) error {
-	maskF := unix.FAN_MARK_ADD | fw.MarkType | mask
+func (fw *FanotifyWatcher) Add(path string) error {
+	flags := unix.FAN_MARK_ADD | fw.flags
 	err := unix.FanotifyMark(
 		fw.Fd,
-		maskF,
-		unix.FAN_CLOSE_WRITE,
+		flags,
+		fw.mask,
 		unix.AT_FDCWD,
 		path,
 	)
 	if err != nil {
-		log.Printf("unix.FanotifyMark(%d, %s|%d|%d=%d, FAN_CLOSE_WRITE, AT_FDCWD, %s) failed: %s\n", fw.Fd,
-			"FAN_MARK_ADD", fw.MarkType, mask, maskF,
+		log.Printf("unix.FanotifyMark(%d, flags=%s|%d, mask=%d, AT_FDCWD, %s) failed: %s\n", fw.Fd,
+			"FAN_MARK_ADD", fw.flags, fw.mask,
 			path, err.Error())
+		return err
 	}
-	return err
+
+	if fw.flags&unix.FAN_MARK_FILESYSTEM == unix.FAN_MARK_FILESYSTEM {
+		fw.mountPath = path
+	}
+	return nil
 }
 
 func (fw *FanotifyWatcher) readEvents() {
@@ -70,6 +152,7 @@ func (fw *FanotifyWatcher) readEvents() {
 		n     int                                      // Number of bytes read with read()
 		errno error                                    // Syscall errno
 		ok    bool                                     // For poller.wait
+		mount *os.File
 	)
 
 	defer close(fw.doneResp)
@@ -77,6 +160,7 @@ func (fw *FanotifyWatcher) readEvents() {
 	defer close(fw.Events)
 	defer unix.Close(fw.Fd)
 	defer fw.poller.Close()
+	fw.isWatching.Store(true)
 
 	for {
 		// See if we have been closed.
@@ -142,20 +226,69 @@ func (fw *FanotifyWatcher) readEvents() {
 				select {
 				case fw.Errors <- ErrEventOverflow:
 				case <-fw.done:
-					return
 				}
+				return
 			}
-
-			path, errno := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", raw.Fd))
-			if errno != nil {
-				select {
-				case fw.Errors <- errno:
-				case <-fw.done:
-					return
+			// Check if filehandles are supported (>5.1)
+			if raw.Fd == unix.FAN_NOFD {
+				fileHandleOffset := int(offset) + int(raw.Metadata_len)
+				// Check if filehandle event info FID is in bounds of the fanotify event
+				if int(raw.Metadata_len)+sizeOfFanotifyEventInfoFID > int(raw.Event_len) {
+					offset += raw.Event_len
+					continue
 				}
-			}
+				// Get FID info
+				info := (*fanotifyEventInfoFID)(unsafe.Pointer(&buf[fileHandleOffset]))
+				if info.Hdr.InfoType == unix.FAN_EVENT_INFO_TYPE_FID {
+					handle, err := info.GetHandle(int(raw.Event_len) - int(raw.Metadata_len))
+					if err != nil {
+						select {
+						case fw.Errors <- err:
+						case <-fw.done:
+							return
+						}
+						offset += raw.Event_len
+						continue
+					}
 
-			fw.Events <- newFanotifyEvent(path, uintptr(raw.Fd))
+					if mount == nil {
+						mount, err = os.Open(fw.mountPath)
+						if err != nil {
+							select {
+							case fw.Errors <- fmt.Errorf("Failed to get mount_fd of %v: %v", fw.mountPath, err):
+							case <-fw.done:
+								return
+							}
+							offset += raw.Event_len
+							continue
+						}
+						defer mount.Close()
+					}
+					path, err := getPathFromHandle(int(mount.Fd()), handle)
+					if err != nil {
+						if !errors.Is(err, unix.ESTALE) {
+							select {
+							case fw.Errors <- err:
+							case <-fw.done:
+								return
+							}
+						}
+					} else {
+						fw.Events <- newFanotifyFIDEvent(path, mask)
+					}
+				}
+			} else {
+				path, errno := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", raw.Fd))
+				if errno != nil {
+					select {
+					case fw.Errors <- errno:
+					case <-fw.done:
+						return
+					}
+				}
+
+				fw.Events <- newFanotifyEvent(path, uintptr(raw.Fd))
+			}
 			offset += raw.Event_len
 		}
 	}
@@ -174,6 +307,18 @@ func newFanotifyEvent(name string, fd uintptr) Event {
 	return Event{Name: name, Op: Write, File: os.NewFile(fd, name)}
 }
 
+func newFanotifyFIDEvent(name string, mask uint64) Event {
+	e := Event{Name: name, File: nil}
+	if mask&unix.FAN_MODIFY == unix.FAN_MODIFY || mask&unix.FAN_CLOSE_WRITE == unix.FAN_CLOSE_WRITE {
+		e.Op |= Write
+	}
+	if mask&unix.FAN_MOVE_SELF == unix.FAN_MOVE_SELF || mask&unix.FAN_MOVE == unix.FAN_MOVE ||
+		mask&unix.FAN_MOVED_TO == unix.FAN_MOVED_TO || mask&unix.FAN_MOVED_FROM == unix.FAN_MOVED_FROM {
+		e.Op |= Move
+	}
+	return e
+}
+
 func (fw *FanotifyWatcher) Close() error {
 	if fw.isClosed() {
 		return nil
@@ -186,7 +331,9 @@ func (fw *FanotifyWatcher) Close() error {
 	_ = fw.poller.Wake()
 
 	// Wait for goroutine to close
-	<-fw.doneResp
+	if fw.isWatching.Load() == true {
+		<-fw.doneResp
+	}
 
 	return nil
 }
